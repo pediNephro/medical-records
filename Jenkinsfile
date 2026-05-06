@@ -2,45 +2,77 @@ pipeline {
     agent any
 
     environment {
-        // Docker Hub Configuration
         DOCKER_HUB_REPO = 'azizos07/medical-records'
-        DOCKER_HUB_CREDS = credentials('dockerhub-creds')
+        SERVICE_NAME    = 'medical-records'
+        SONAR_HOST      = 'http://172.17.0.2:9000'
 
-        // Build Configuration
-        JAVA_VERSION = '17'
-        MAVEN_VERSION = '3.9.0'
-        SERVICE_NAME = 'medical-records'
-        SERVICE_PORT = '8082'
+        MYSQL_CONTAINER = "test-mysql-${BUILD_NUMBER}"
+        MYSQL_PORT      = '3308'
+        MYSQL_DATABASE  = 'testdb'
+        MYSQL_ROOT_PASSWORD = 'root'
     }
 
     stages {
+
         stage('Checkout') {
             steps {
-                echo "=== Cloning Repository ==="
                 checkout scm
-                sh 'git log -1 --pretty=format:"%H %s"'
             }
         }
 
         stage('Build') {
             steps {
-                echo "=== Building with Maven ==="
-                sh '''
-                    mvn clean package -DskipTests \
-                        -Dmaven.compiler.source=17 \
-                        -Dmaven.compiler.target=17
-                '''
+                sh 'mvn clean package -DskipTests'
+            }
+        }
+
+        stage('Start Test MySQL') {
+            steps {
+                sh """
+                    docker run -d \
+                        --name ${MYSQL_CONTAINER} \
+                        -e MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD} \
+                        -e MYSQL_DATABASE=${MYSQL_DATABASE} \
+                        -e MYSQL_ROOT_HOST='%' \
+                        -p ${MYSQL_PORT}:3306 \
+                        mysql:8
+
+                    echo "Waiting for MySQL..."
+                    for i in \$(seq 1 60); do
+                        if docker run --rm --network host mysql:8 mysqladmin ping \
+                            -h 127.0.0.1 \
+                            -P ${MYSQL_PORT} \
+                            -u root \
+                            -p${MYSQL_ROOT_PASSWORD} \
+                            --silent 2>/dev/null; then
+                            echo "MySQL ready after \${i}s"
+                            break
+                        fi
+
+                        if [ \$i -eq 60 ]; then
+                            echo "=== MySQL logs ==="
+                            docker logs ${MYSQL_CONTAINER}
+                            exit 1
+                        fi
+
+                        sleep 2
+                    done
+                """
             }
         }
 
         stage('Unit Tests') {
             steps {
-                echo "=== Running Unit Tests ==="
-                sh '''
+                sh """
                     mvn test \
-                        -Dtest=**/*Test.class \
-                        -Dgroups!="integration"
-                '''
+                        -Dspring.datasource.url=jdbc:mysql://localhost:${MYSQL_PORT}/${MYSQL_DATABASE} \
+                        -Dspring.datasource.username=root \
+                        -Dspring.datasource.password=${MYSQL_ROOT_PASSWORD} \
+                        -Dspring.jpa.hibernate.ddl-auto=create-drop \
+                        -Dspring.jpa.database-platform=org.hibernate.dialect.MySQL8Dialect \
+                        -Deureka.client.enabled=false \
+                        -Dspring.security.oauth2.resourceserver.jwt.jwk-set-uri=http://localhost
+                """
             }
             post {
                 always {
@@ -50,59 +82,66 @@ pipeline {
         }
 
         stage('SonarQube Analysis') {
-            when {
-                branch 'main'
-            }
             steps {
-                echo "=== Code Quality Analysis ==="
-                sh '''
-                    mvn sonar:sonar \
-                        -Dsonar.projectKey=medical-records \
-                        -Dsonar.host.url=http://sonarqube:9000 \
+                withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
+                    sh """
+                        mvn sonar:sonar \
+                        -Dsonar.projectKey=${SERVICE_NAME} \
+                        -Dsonar.projectName=${SERVICE_NAME} \
+                        -Dsonar.host.url=${SONAR_HOST} \
                         -Dsonar.login=${SONAR_TOKEN}
-                '''
+                    """
+                }
             }
         }
 
         stage('Build Docker Image') {
             steps {
-                echo "=== Building Docker Image ==="
-                script {
-                    sh '''
-                        docker build -t ${DOCKER_HUB_REPO}:${BUILD_NUMBER} .
-                        docker tag ${DOCKER_HUB_REPO}:${BUILD_NUMBER} ${DOCKER_HUB_REPO}:latest
-                    '''
+                sh """
+                    docker build -t ${DOCKER_HUB_REPO}:${BUILD_NUMBER} .
+                    docker tag ${DOCKER_HUB_REPO}:${BUILD_NUMBER} ${DOCKER_HUB_REPO}:latest
+                """
+            }
+        }
+
+        stage('Push Docker') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'dockerhub-creds',
+                    usernameVariable: 'USER',
+                    passwordVariable: 'PASS')]) {
+
+                    sh """
+                        echo $PASS | docker login -u $USER --password-stdin
+                        docker push ${DOCKER_HUB_REPO}:${BUILD_NUMBER}
+                        docker push ${DOCKER_HUB_REPO}:latest
+                        docker logout
+                    """
                 }
             }
         }
 
-        stage('Push to Docker Hub') {
+        stage('Trigger Deploy') {
             steps {
-                echo "=== Pushing Image to Docker Hub ==="
-                script {
-                    sh '''
-                        echo $DOCKER_HUB_CREDS_PSW | docker login -u $DOCKER_HUB_CREDS_USR --password-stdin
-                        docker push ${DOCKER_HUB_REPO}:${BUILD_NUMBER}
-                        docker push ${DOCKER_HUB_REPO}:latest
-                        docker logout
-                    '''
-                }
+                build job: 'medical-records-deploy', parameters: [
+                    string(name: 'BUILD_NUMBER', value: "${BUILD_NUMBER}")
+                ]
             }
         }
     }
 
     post {
+        always {
+            sh """
+                echo "Cleaning MySQL..."
+                docker stop ${MYSQL_CONTAINER} || true
+                docker rm   ${MYSQL_CONTAINER} || true
+            """
+        }
         success {
             echo "✅ Pipeline SUCCESS"
-            // Send notification
         }
         failure {
             echo "❌ Pipeline FAILED"
-            // Send notification
-        }
-        always {
-            sh 'docker logout'
-            cleanWs()
         }
     }
 }
